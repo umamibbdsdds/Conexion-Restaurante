@@ -1,6 +1,5 @@
 // ============================================================
-//  server.js  —  API UMAMI Restaurante (Versión Estable)
-//  Backend para Railway (MySQL) + compatible con App Flutter
+//  server.js  —  API UMAMI Restaurante (Optimizado para Railway)
 // ============================================================
 
 const express  = require("express");
@@ -16,7 +15,18 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Configuration de Conexión a MySQL ──
+// ── MIDDLEWARE REESCRITOR DE RUTAS ──
+// Si Flutter solicita /api/login, /api/platillos, etc., elimina automáticamente '/api'
+app.use((req, _res, next) => {
+    if (req.url.startsWith('/api/')) {
+        req.url = req.url.replace('/api', '');
+    } else if (req.url === '/api') {
+        req.url = '/';
+    }
+    next();
+});
+
+// ── Configuración de Conexión a MySQL en Railway ──
 const connectionUrl =
     process.env.MYSQL_URL       ||
     process.env.DATABASE_URL    ||
@@ -41,7 +51,7 @@ const pool = connectionUrl
           queueLimit: 0,
       });
 
-// ── Logger de Solicitudes ──
+// ── Logger de Solicitudes (Visible en los Logs de Railway) ──
 app.use((req, _res, next) => {
     console.log(`\n[REQ] [${new Date().toLocaleTimeString()}] ${req.method} ${req.url}`);
     if (req.body && Object.keys(req.body).length > 0) {
@@ -164,7 +174,7 @@ async function asegurarEsquema() {
                 FOREIGN KEY (pedido_id)   REFERENCES pedidos(id) ON DELETE CASCADE
             )
         `);
-        console.log("[OK] [ESQUEMA] Tablas verificadas/creadas correctamente");
+        console.log("[OK] [ESQUEMA] Tablas verificadas/creadas correctamente en Railway");
     } catch (err) {
         console.error("[ERROR] [ESQUEMA] No se pudo verificar el esquema:", err.message);
     }
@@ -172,7 +182,7 @@ async function asegurarEsquema() {
 
 // ── Salud del Servidor ──
 app.get("/", (_req, res) => {
-    res.json({ status: "ok", servicio: "UMAMI Restaurante API" });
+    res.json({ status: "ok", servicio: "UMAMI Restaurante API en Railway" });
 });
 
 app.get("/health", async (_req, res) => {
@@ -630,13 +640,13 @@ app.use((_req, res) => {
     res.status(404).json({ status: "error", mensaje: "Ruta de API no encontrada" });
 });
 
-// ── Iniciar Servidor ──
+// ── Iniciar Servidor en Railway ──
 const PORT = process.env.PORT || 3000;
 
 asegurarEsquema().finally(() => {
     app.listen(PORT, "0.0.0.0", () => {
-        console.log("\n=== Servidor UMAMI Restaurante Listo ===");
+        console.log("\n=== Servidor UMAMI Restaurante Listo en Railway ===");
         console.log("    Puerto: " + PORT);
-        console.log("========================================\n");
+        console.log("===================================================\n");
     });
 });
