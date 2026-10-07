@@ -1,30 +1,6 @@
 // ============================================================
 //  server.js  —  API UMAMI Restaurante
 //  Backend para Railway (MySQL) + compatible con mesas1.py
-//
-//  Estructura basada en el server.js de Cocina Escolar INFRAMEN:
-//   - Pool de conexiones compatible con Railway (MYSQL_URL) o locales
-//   - Logger detallado en cada solicitud
-//   - Exportación Excel y PDF
-//
-//  Endpoints:
-//   GET  /categorias         → lista de categorías del menú
-//   GET  /platillos          → todos los platillos (o ?categoria=X)
-//   GET  /platillo/:id       → un platillo por ID
-//   POST /pedido             → crear pedido para una mesa
-//   GET  /pedido/:mesa       → pedido activo de la mesa
-//   PUT  /pedido/:mesa/estado→ cambiar estado del pedido
-//   GET  /mesas              → lista de mesas y estados
-//   GET  /mesa/:numero       → estado de una mesa
-//   POST /solicitar-mesero  → solicitar mesero para mesa
-//   POST /solicitar-cuenta  → solicitar la cuenta/pago
-//   PUT  /pago/:mesa/estado  → cambiar estado del pago
-//   GET  /pago/:mesa         → estado del pago de la mesa
-//   GET  /estado-qr/:mesa    → verificar si QR fue escaneado
-//   GET  /informe             → resumen de ventas del día (JSON)
-//   GET  /informe/:fecha      → resumen histórico
-//   GET  /informe/exportar/excel[/:fecha]
-//   GET  /informe/exportar/pdf[/:fecha]
 // ============================================================
 
 const express  = require("express");
@@ -41,10 +17,6 @@ app.use(cors());
 app.use(express.json());
 
 // ── Pool de conexiones ──
-// Soporta 3 escenarios sin tocar el código:
-//   1) Railway con URL completa  → MYSQL_URL / DATABASE_URL / MYSQL_PUBLIC_URL
-//   2) Railway por variables sueltas → MYSQLHOST, MYSQLPORT, MYSQLUSER...
-//   3) Variables genéricas / local  → DB_HOST, DB_PORT, DB_USER... (o defaults)
 const connectionUrl =
     process.env.MYSQL_URL       ||
     process.env.DATABASE_URL    ||
@@ -96,6 +68,17 @@ function responderError(res, contexto, err, status = 500) {
 // ── Asegurar esquema mínimo ──
 async function asegurarEsquema() {
     try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id       INT AUTO_INCREMENT PRIMARY KEY,
+                usuario  VARCHAR(50) NOT NULL UNIQUE,
+                clave    VARCHAR(255) NOT NULL,
+                rol      ENUM('Administrador', 'Mesero', 'Cocinero', 'Cliente') NOT NULL,
+                mesa_id  INT DEFAULT NULL,
+                activo   TINYINT(1) NOT NULL DEFAULT 1,
+                creado   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
         await pool.query(`
             CREATE TABLE IF NOT EXISTS categorias (
                 id       INT AUTO_INCREMENT PRIMARY KEY,
@@ -189,6 +172,84 @@ app.get("/", (_req, res) => {
 });
 
 // ============================================================
+//  AUTENTICACIÓN Y USUARIOS
+// ============================================================
+
+// Inicio de sesión
+app.post("/login", async (req, res) => {
+    const { usuario, clave } = req.body;
+    console.log(`   [LOGIN] Intento de login para usuario: ${usuario}`);
+
+    if (!usuario || !clave) {
+        console.log("   [AVISO] Faltan credenciales en la petición");
+        return res.status(400).json({ status: "error", mensaje: "Ingresa usuario y contraseña" });
+    }
+
+    try {
+        const [rows] = await pool.query(
+            "SELECT id, usuario, clave, rol, mesa_id, activo FROM usuarios WHERE usuario = ?",
+            [usuario]
+        );
+
+        if (rows.length === 0) {
+            console.log(`   [AVISO] Usuario '${usuario}' no encontrado`);
+            return res.status(401).json({ status: "error", mensaje: "Usuario o contraseña incorrectos" });
+        }
+
+        const user = rows[0];
+
+        if (!user.activo) {
+            console.log(`   [AVISO] Usuario '${usuario}' inactivo`);
+            return res.status(403).json({ status: "error", mensaje: "El usuario está inactivo" });
+        }
+
+        // Validación en texto plano (según el INSERT realizado)
+        if (user.clave !== String(clave)) {
+            console.log(`   [AVISO] Contraseña incorrecta para usuario: ${usuario}`);
+            return res.status(401).json({ status: "error", mensaje: "Usuario o contraseña incorrectos" });
+        }
+
+        // Ocultar clave antes de responder
+        delete user.clave;
+
+        console.log(`   [OK] Login exitoso: ${user.usuario} (Rol: ${user.rol})`);
+        res.json({
+            status: "ok",
+            mensaje: "Inicio de sesión exitoso",
+            usuario: user
+        });
+    } catch (err) {
+        responderError(res, "Fallo al iniciar sesión", err);
+    }
+});
+
+// Registro de usuarios
+app.post("/registro", async (req, res) => {
+    const { usuario, clave, rol, mesa_id } = req.body;
+    console.log(`   [REGISTRO] Creando usuario: ${usuario}`);
+
+    if (!usuario || !clave || !rol) {
+        return res.status(400).json({ status: "error", mensaje: "Faltan campos obligatorios (usuario, clave, rol)" });
+    }
+
+    try {
+        const [result] = await pool.query(
+            "INSERT INTO usuarios (usuario, clave, rol, mesa_id, activo) VALUES (?, ?, ?, ?, 1)",
+            [usuario, clave, rol, mesa_id || null]
+        );
+
+        console.log(`   [OK] Usuario creado con ID: ${result.insertId}`);
+        res.status(201).json({
+            status: "ok",
+            mensaje: "Usuario registrado con éxito",
+            id: result.insertId
+        });
+    } catch (err) {
+        responderError(res, "Fallo al registrar usuario", err);
+    }
+});
+
+// ============================================================
 //  CATEGORÍAS
 // ============================================================
 app.get("/categorias", async (_req, res) => {
@@ -258,7 +319,6 @@ app.get("/platillo/:id", async (req, res) => {
 //  PEDIDOS
 // ============================================================
 
-// Crear pedido (enviar orden desde la mesa)
 app.post("/pedido", async (req, res) => {
     const { mesa, items } = req.body;
     console.log(`   [PEDIDO] Nuevo pedido para mesa ${mesa}, ${items ? items.length : 0} item(s)`);
@@ -272,7 +332,6 @@ app.post("/pedido", async (req, res) => {
     try {
         await connection.beginTransaction();
 
-        // 1) Obtener precios de los platillos
         const platilloIds = items.map(i => i.platillo_id);
         const [platillos] = await connection.query(
             "SELECT id, precio FROM platillos WHERE id IN (?)",
@@ -289,7 +348,6 @@ app.post("/pedido", async (req, res) => {
         const precioMap = {};
         platillos.forEach(p => { precioMap[p.id] = Number(p.precio); });
 
-        // 2) Calcular total
         let total = 0;
         const enrichedItems = items.map(i => {
             const pu = precioMap[i.platillo_id];
@@ -297,14 +355,12 @@ app.post("/pedido", async (req, res) => {
             return { ...i, precio_unitario: pu };
         });
 
-        // 3) Crear pedido
         const [pedidoRes] = await connection.query(
             "INSERT INTO pedidos (mesa_numero, estado, total) VALUES (?, 'recibido', ?)",
             [mesa, total]
         );
         const pedidoId = pedidoRes.insertId;
 
-        // 4) Insertar items
         for (const item of enrichedItems) {
             await connection.query(
                 "INSERT INTO pedido_items (pedido_id, platillo_id, cantidad, nota, estado, precio_unitario) VALUES (?, ?, ?, ?, 'recibido', ?)",
@@ -312,7 +368,6 @@ app.post("/pedido", async (req, res) => {
             );
         }
 
-        // 5) Actualizar estado de la mesa
         await connection.query(
             "UPDATE mesas SET estado = 'en_cocina' WHERE numero = ?",
             [mesa]
@@ -335,7 +390,6 @@ app.post("/pedido", async (req, res) => {
     }
 });
 
-// Obtener pedido activo de una mesa
 app.get("/pedido/:mesa", async (req, res) => {
     const mesa = req.params.mesa;
     console.log(`   [BUSCAR] Consultando pedido activo de mesa ${mesa}`);
@@ -360,7 +414,6 @@ app.get("/pedido/:mesa", async (req, res) => {
             return res.json({ status: "ok", pedido: null });
         }
         const pedido = pedidos[0];
-        // Parsear items si viene como string (MySQL puede devolver string para JSON)
         if (typeof pedido.items === "string") {
             try { pedido.items = JSON.parse(pedido.items); } catch(e) { pedido.items = []; }
         }
@@ -371,7 +424,6 @@ app.get("/pedido/:mesa", async (req, res) => {
     }
 });
 
-// Cambiar estado de un pedido (cocina → listo, mesero → entregado, etc.)
 app.put("/pedido/:mesa/estado", async (req, res) => {
     const mesa = Number(req.params.mesa);
     const { estado } = req.body;
@@ -404,14 +456,12 @@ app.put("/pedido/:mesa/estado", async (req, res) => {
             [estado, pedidoId]
         );
 
-        // Si todos los items se entregan, actualizar mesa
         let nuevoEstadoMesa = null;
         if (estado === "entregado") {
             nuevoEstadoMesa = "lista";
         } else if (estado === "preparando") {
             nuevoEstadoMesa = "en_cocina";
         } else if (estado === "cancelado") {
-            // Verificar si quedan otros pedidos
             const [otros] = await connection.query(
                 "SELECT COUNT(*) AS total FROM pedidos WHERE mesa_numero = ? AND estado NOT IN ('entregado','cancelado') AND id != ?",
                 [mesa, pedidoId]
@@ -482,7 +532,6 @@ app.post("/solicitar-mesero", async (req, res) => {
     }
 
     try {
-        // Buscar primer mesero activo disponible
         const [meseros] = await pool.query(
             "SELECT id, nombre FROM meseros WHERE activo = 1 ORDER BY id LIMIT 1"
         );
@@ -501,7 +550,6 @@ app.post("/solicitar-mesero", async (req, res) => {
 //  PAGO / CUENTA
 // ============================================================
 
-// Solicitar la cuenta
 app.post("/solicitar-cuenta", async (req, res) => {
     const { mesa } = req.body;
     console.log(`   [CUENTA] Solicitud de cuenta para mesa ${mesa}`);
@@ -515,7 +563,6 @@ app.post("/solicitar-cuenta", async (req, res) => {
     try {
         await connection.beginTransaction();
 
-        // Obtener pedido activo
         const [pedidos] = await connection.query(
             "SELECT id, total FROM pedidos WHERE mesa_numero = ? AND estado NOT IN ('entregado','cancelado') ORDER BY creado DESC LIMIT 1",
             [mesa]
@@ -530,7 +577,6 @@ app.post("/solicitar-cuenta", async (req, res) => {
         const pedidoId = pedidos[0].id;
         const total = Number(pedidos[0].total);
 
-        // Crear o actualizar registro de pago
         const [pagos] = await connection.query(
             "SELECT id, estado FROM pagos WHERE mesa_numero = ? AND pedido_id = ? AND estado IN ('pendiente','solicitado') LIMIT 1",
             [mesa, pedidoId]
@@ -553,7 +599,6 @@ app.post("/solicitar-cuenta", async (req, res) => {
             console.log("   [OK] Pago creado: ID " + pagoId + ", monto=$" + total.toFixed(2));
         }
 
-        // Actualizar mesa
         await connection.query(
             "UPDATE mesas SET estado = 'cuenta_pedida' WHERE numero = ?",
             [mesa]
@@ -576,7 +621,6 @@ app.post("/solicitar-cuenta", async (req, res) => {
     }
 });
 
-// Cambiar estado del pago (admin autoriza, marca pagado)
 app.put("/pago/:mesa/estado", async (req, res) => {
     const mesa = Number(req.params.mesa);
     const { estado, metodo } = req.body;
@@ -615,13 +659,11 @@ app.put("/pago/:mesa/estado", async (req, res) => {
 
         await connection.query(sql, updateFields);
 
-        // Si se marca como pagado, liberar la mesa
         if (estado === "pagado") {
             await connection.query(
                 "UPDATE mesas SET estado = 'pagada', qr_escaneado = 0 WHERE numero = ?",
                 [mesa]
             );
-            // También marcar el pedido como entregado
             await connection.query(
                 "UPDATE pedidos SET estado = 'entregado' WHERE id = ?",
                 [pagos[0].pedido_id]
@@ -646,7 +688,6 @@ app.put("/pago/:mesa/estado", async (req, res) => {
     }
 });
 
-// Obtener estado del pago de una mesa
 app.get("/pago/:mesa", async (req, res) => {
     const mesa = req.params.mesa;
     console.log(`   [BUSCAR] Consultando estado de pago, mesa ${mesa}`);
@@ -692,7 +733,6 @@ app.get("/estado-qr/:mesa", async (req, res) => {
     }
 });
 
-// Registrar escaneo de QR
 app.post("/escanear-qr/:mesa", async (req, res) => {
     const mesa = req.params.mesa;
     console.log(`   [QR] Registrando escaneo QR, mesa ${mesa}`);
@@ -714,7 +754,6 @@ app.post("/escanear-qr/:mesa", async (req, res) => {
 
 // ============================================================
 //  INFORMES Y EXPORTACIÓN
-//  [AVISO] Las rutas /informe/exportar/* ANTES de /informe/:fecha
 // ============================================================
 
 async function consultarInforme(fecha) {
@@ -737,7 +776,6 @@ async function consultarInforme(fecha) {
     return rows;
 }
 
-// Exportar Excel - hoy
 app.get("/informe/exportar/excel", async (_req, res) => {
     const fecha = hoyLocal();
     console.log(`   [EXCEL] Exportando Excel del día: ${fecha}`);
@@ -750,7 +788,6 @@ app.get("/informe/exportar/excel", async (_req, res) => {
     }
 });
 
-// Exportar Excel - fecha específica
 app.get("/informe/exportar/excel/:fecha", async (req, res) => {
     const fecha = req.params.fecha;
     console.log(`   [EXCEL] Exportando Excel histórico: ${fecha}`);
@@ -764,7 +801,6 @@ app.get("/informe/exportar/excel/:fecha", async (req, res) => {
     }
 });
 
-// Exportar PDF - hoy
 app.get("/informe/exportar/pdf", async (_req, res) => {
     const fecha = hoyLocal();
     console.log(`   [PDF] Exportando PDF del día: ${fecha}`);
@@ -777,7 +813,6 @@ app.get("/informe/exportar/pdf", async (_req, res) => {
     }
 });
 
-// Exportar PDF - fecha específica
 app.get("/informe/exportar/pdf/:fecha", async (req, res) => {
     const fecha = req.params.fecha;
     console.log(`   [PDF] Exportando PDF histórico: ${fecha}`);
@@ -791,7 +826,6 @@ app.get("/informe/exportar/pdf/:fecha", async (req, res) => {
     }
 });
 
-// Informe de hoy (JSON)
 app.get("/informe", async (_req, res) => {
     const fecha = hoyLocal();
     console.log(`   [INFORME] Informe del día solicitado: ${fecha}`);
@@ -804,7 +838,6 @@ app.get("/informe", async (_req, res) => {
     }
 });
 
-// Informe histórico por fecha — DESPUÉS de /informe/exportar/*
 app.get("/informe/:fecha", async (req, res) => {
     const fechaParam = req.params.fecha;
     console.log(`   [INFORME] Informe histórico solicitado para: ${fechaParam}`);
@@ -879,7 +912,6 @@ async function enviarPDF(res, rows, titulo, tituloTabla, nombreArchivo) {
 }
 
 // ── Iniciar servidor ──
-// Railway inyecta PORT. En local usa 3000.
 const PORT = process.env.PORT || 3000;
 
 asegurarEsquema().finally(() => {
